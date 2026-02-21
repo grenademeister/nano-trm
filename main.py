@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from datasets import load_dataset, Features, Value
 from torch.utils.data import DataLoader
 import argparse
@@ -43,13 +44,83 @@ def print_model_parameter_count(model: nn.Module) -> None:
     print(f"Trainable parameters: {trainable_params:,}")
 
 
+class TokenGate(nn.Module):
+    def __init__(self,dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim,dim*2),
+            nn.GELU(),
+            nn.Linear(dim*2,1)
+        )
+        nn.init.constant_(self.net[-1].bias, 1.0)
+    
+    def forward(self,x):
+        return torch.sigmoid(self.net(x))
+        
+
+class RotaryMultiheadAttention(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int, base: int = 10000):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be divisible by num_heads")
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        if self.head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for RoPE")
+        self.scale = self.head_dim ** -0.5
+        self.base = base
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def _rope_cache(self, seq_len: int, device, dtype):
+        half_dim = self.head_dim // 2
+        freq_seq = torch.arange(half_dim, device=device, dtype=torch.float32)
+        inv_freq = self.base ** (-freq_seq / half_dim)
+        pos = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.outer(pos, inv_freq)
+        cos = torch.cos(freqs).to(dtype=dtype)
+        sin = torch.sin(freqs).to(dtype=dtype)
+        return cos, sin
+
+    def _apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+        x_rot_even = x_even * cos - x_odd * sin
+        x_rot_odd = x_even * sin + x_odd * cos
+        return torch.stack((x_rot_even, x_rot_odd), dim=-1).flatten(-2)
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
+        bsz, q_len, _ = query.shape
+        _, k_len, _ = key.shape
+
+        q = self.q_proj(query).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(key).view(bsz, k_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(value).view(bsz, k_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        q_cos, q_sin = self._rope_cache(q_len, q.device, q.dtype)
+        k_cos, k_sin = self._rope_cache(k_len, k.device, k.dtype)
+        q = self._apply_rope(q, q_cos, q_sin)
+        k = self._apply_rope(k, k_cos, k_sin)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_out = torch.matmul(attn_weights, v)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, q_len, self.embed_dim)
+        return self.out_proj(attn_out), attn_weights
+
+
 class TinyNetworkBlock(nn.Module):
     def __init__(self, embed_dim=512, num_heads=8,att='self_att'):
         super().__init__()
         self.norm1 = nn.LayerNorm(embed_dim)
         self.att= att
         if(att == 'self_att'):
-            self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+            self.attn = RotaryMultiheadAttention(embed_dim, num_heads)
         elif(att == 'mlp'):
             self.attn =nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
@@ -59,21 +130,20 @@ class TinyNetworkBlock(nn.Module):
         else:
             raise ValueError(f"arg parse att should be att or mlp , not {att}")
         self.norm2 = nn.LayerNorm(embed_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.GELU(),
-            nn.Linear(embed_dim * 4, embed_dim),
-        )
+        hidden_dim = embed_dim * 4
+        self.ffn_value = nn.Linear(embed_dim, hidden_dim)
+        self.ffn_gate = nn.Linear(embed_dim, hidden_dim)
+        self.ffn_out = nn.Linear(hidden_dim, embed_dim)
 
-    def forward(self, query, context):
+    def forward(self, query):
         # maybe add pre-norm later?
         if(self.att == "self_att"):
-            attn_output, _ = self.attn(query, context, context)
+            attn_output, _ = self.attn(query, query, query)
         else:
-            mixed = torch.cat([query,context],dim=-1)
+            mixed = torch.cat([query,query],dim=-1)
             attn_output = self.attn(mixed)
         query = self.norm1(query + attn_output)
-        ff_output = self.mlp(query)
+        ff_output = self.ffn_out(self.ffn_value(query) * F.silu(self.ffn_gate(query)))
         query = self.norm2(query + ff_output)
         return query
 
@@ -82,25 +152,23 @@ class TRM(nn.Module):
     def __init__(self, embed_dim=512, n_reasoning_steps=6, n_recursion_steps=3,att='self_att'):
         super().__init__()
         self.net = TinyNetworkBlock(embed_dim,att=att)
-        self.net2 = TinyNetworkBlock(embed_dim,att=att)
+        
         self.n = n_reasoning_steps
         self.T = n_recursion_steps
         self.token_embedding = nn.Embedding(10, embed_dim)
-        self.positional_embedding = nn.Embedding(81, embed_dim)
         self.output_head = nn.Linear(embed_dim, 10)  # For Sudoku (0-9 tokens)
-
+        self.x_gate = TokenGate(embed_dim)
+        self.y_gate = TokenGate(embed_dim)
     def embed_input(self, x):
-        batch_size, seq_len = x.size()
-        pos_ids = (
-            torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
-        )
-        return self.token_embedding(x) + self.positional_embedding(pos_ids)
+        return self.token_embedding(x)
 
     def latent_recursion(self, x, y, z):
         for _ in range(self.n):  # latent reasoning
-            combined_context = torch.cat([x, y], dim=1)
-            z = self.net(query=z, context=combined_context)
-        y = self.net2(query=y, context=z)  # answer refinement
+            # combined_context = torch.cat([x, y], dim=1)
+            x_ = self.x_gate(y+z) * x
+            y_ = self.y_gate(z)*y
+            z = self.net(query=x_+y_+z)
+        y = self.net(query=z+y)  # answer refinement
         return y, z
 
     def forward(self, x, y, z):
@@ -118,9 +186,9 @@ def main():
     parser.add_argument('--ema',action='store_true',help='using ema')
     args = parser.parse_args()
     embed_dim = 512
-    batch_size = 2
-    max_supervision_steps = 16  # N_sup from the paper
-    max_val_batches = 1
+    batch_size = 32
+    max_supervision_steps = 8  # N_sup from the paper
+    max_val_batches = 100
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -133,8 +201,9 @@ def main():
     lr=1e-4,
     betas=(0.9,0.95),
     weight_decay=0.1)
-    warmup_step=200
-    training_step=1000
+    t=400
+    warmup_step=(t//5) * max_supervision_steps
+    training_step=t * max_supervision_steps
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_step,
@@ -165,6 +234,8 @@ def main():
         pin_memory=(device.type == "cuda"),
     )
 
+    train_correct = 0
+    train_total = 0
     for batch_idx, batch in enumerate(train_loader):
         question_tokens = torch.tensor(
             [encode_row(q) for q in batch["question"]], dtype=torch.long, device=device
@@ -172,12 +243,16 @@ def main():
         answer_tokens = torch.tensor(
             [encode_row(a) for a in batch["answer"]], dtype=torch.long, device=device
         )
-
+      
+        ds_y_deltas = []
         for _ in range(max_supervision_steps):
             optimizer.zero_grad(set_to_none=True)
             x = trm_model.embed_input(question_tokens)
             if(args.ds and (_!=0)):
+                y_prev = y.detach()
                 (y,z),y_hat = trm_model(x,y,z)
+                ds_y_delta = (y - y_prev).abs().mean().item()
+                ds_y_deltas.append(ds_y_delta)
             else:
                 y = x.clone()
                 z = x.clone()
@@ -188,6 +263,21 @@ def main():
             lr_scheduler.step()
             if(args.ema):
                 ema_model.update(trm_model)
+        preds = y_hat.argmax(dim=-1)
+        batch_correct = (preds == answer_tokens).sum().item()
+        batch_total = answer_tokens.numel()
+        train_correct += batch_correct
+        train_total += batch_total
+        batch_train_acc = batch_correct / max(1, batch_total)
+        running_train_acc = train_correct / max(1, train_total)
+        if ds_y_deltas:
+            ds_y_delta_mean = sum(ds_y_deltas) / len(ds_y_deltas)
+            ds_y_delta_last = ds_y_deltas[-1]
+            ds_delta_msg = (
+                f" ds_y_delta_mean={ds_y_delta_mean:.6f} ds_y_delta_last={ds_y_delta_last:.6f}"
+            )
+        else:
+            ds_delta_msg = ""
         if batch_idx % 5 == 0:
             if(args.ema):
                 with torch.no_grad():
@@ -196,9 +286,18 @@ def main():
                     z = x.clone()
                     (a, b), y_hat = ema_model.module(x, y, z)
                     ema_loss = loss_fn(y_hat.reshape(-1, 10), answer_tokens.reshape(-1))
-                print(f"batch={batch_idx} loss={loss.item():.4f} ema loss={ema_loss.item():.4f}")
+                    ema_preds = y_hat.argmax(dim=-1)
+                    ema_train_acc = (ema_preds == answer_tokens).float().mean().item()
+                print(
+                    f"batch={batch_idx} loss={loss.item():.4f} train_acc={batch_train_acc:.4f} "
+                    f"running_train_acc={running_train_acc:.4f} ema loss={ema_loss.item():.4f} "
+                    f"ema_train_acc={ema_train_acc:.4f}{ds_delta_msg}"
+                )
             else:
-                print(f"batch={batch_idx} loss={loss.item():.4f} ")
+                print(
+                    f"batch={batch_idx} loss={loss.item():.4f} train_acc={batch_train_acc:.4f} "
+                    f"running_train_acc={running_train_acc:.4f}{ds_delta_msg}"
+                )
         if batch_idx >= training_step:  # Train on a subset for demo purposes
             break
 

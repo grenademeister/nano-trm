@@ -1,0 +1,38 @@
+data:
+  dataset_name: sapientinc/sudoku-extreme
+  cache_dir: data/sudoku_extreme_cache
+  train_cache_size: 1000
+  val_cache_size: 100
+  test_size: 0.01
+  split_seed: 42
+
+model:
+  embed_dim: 512
+  n_reasoning_steps: 6
+  n_recursion_steps: 3
+  att: self_att
+
+train:
+
+  batch_size: 32
+  num_epochs: 100
+  max_supervision_steps: 16
+  ds: true
+  ema: true
+  ema_decay: 0.999
+
+optimizer:
+  lr: 0.0001
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.1
+
+scheduler:
+  warmup_ratio: 0.2
+
+validation:
+  batch_size: 32
+  max_batches: 100
+
+logging:
+  every_progress_pct: 20

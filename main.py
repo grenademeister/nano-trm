@@ -62,11 +62,19 @@ class TRM(nn.Module):
         self.n = n_reasoning_steps
         self.T = n_recursion_steps
         self.token_embedding = nn.Embedding(10, embed_dim)
+        self.positional_embedding = nn.Embedding(81, embed_dim)
         self.output_head = nn.Linear(embed_dim, 10)  # For Sudoku (0-9 tokens)
+
+    def embed_input(self, x):
+        batch_size, seq_len = x.size()
+        pos_ids = (
+            torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
+        )
+        return self.token_embedding(x) + self.positional_embedding(pos_ids)
 
     def latent_recursion(self, x, y, z):
         for _ in range(self.n):  # latent reasoning
-            combined_context = 0.5 * (x + y)
+            combined_context = torch.cat([x, y], dim=1)
             z = self.net(query=z, context=combined_context)
         y = self.net(query=y, context=z)  # answer refinement
         return y, z
@@ -81,9 +89,9 @@ class TRM(nn.Module):
 
 def main():
     embed_dim = 512
-    batch_size = 32
+    batch_size = 16
     max_supervision_steps = 16  # N_sup from the paper
-    max_val_batches = 20
+    max_val_batches = 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -120,19 +128,21 @@ def main():
         answer_tokens = torch.tensor(
             [encode_row(a) for a in batch["answer"]], dtype=torch.long, device=device
         )
-        x = trm_model.token_embedding(question_tokens)
-        y = torch.zeros_like(x)
-        z = torch.zeros_like(x)
+        x = trm_model.embed_input(question_tokens)
+        y = x.clone()
+        z = x.clone()
 
         for _ in range(max_supervision_steps):
             optimizer.zero_grad(set_to_none=True)
-            x = trm_model.token_embedding(question_tokens)
+            x = trm_model.embed_input(question_tokens)
             (y, z), y_hat = trm_model(x, y, z)
             loss = loss_fn(y_hat.reshape(-1, 10), answer_tokens.reshape(-1))
             loss.backward()
             optimizer.step()
-        if batch_idx % 100 == 0:
+        if batch_idx % 1 == 0:
             print(f"batch={batch_idx} loss={loss.item():.4f}")
+        if batch_idx >= 100:  # Train on a subset for demo purposes
+            break
 
     trm_model.eval()
     val_loss = 0.0
@@ -151,12 +161,12 @@ def main():
                 dtype=torch.long,
                 device=device,
             )
-            x = trm_model.token_embedding(question_tokens)
-            y = torch.zeros_like(x)
-            z = torch.zeros_like(x)
+            x = trm_model.embed_input(question_tokens)
+            y = x.clone()
+            z = x.clone()
 
             for _ in range(max_supervision_steps):
-                x = trm_model.token_embedding(question_tokens)
+                x = trm_model.embed_input(question_tokens)
                 (y, z), y_hat = trm_model(x, y, z)
 
             loss = loss_fn(y_hat.reshape(-1, 10), answer_tokens.reshape(-1))

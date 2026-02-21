@@ -128,14 +128,13 @@ def main():
         answer_tokens = torch.tensor(
             [encode_row(a) for a in batch["answer"]], dtype=torch.long, device=device
         )
-        x = trm_model.embed_input(question_tokens)
-        y = x.clone()
-        z = x.clone()
 
         for _ in range(max_supervision_steps):
             optimizer.zero_grad(set_to_none=True)
             x = trm_model.embed_input(question_tokens)
-            (y, z), y_hat = trm_model(x, y, z)
+            y = x.clone()
+            z = x.clone()
+            (_, _), y_hat = trm_model(x, y, z)
             loss = loss_fn(y_hat.reshape(-1, 10), answer_tokens.reshape(-1))
             loss.backward()
             optimizer.step()
@@ -164,10 +163,7 @@ def main():
             x = trm_model.embed_input(question_tokens)
             y = x.clone()
             z = x.clone()
-
-            for _ in range(max_supervision_steps):
-                x = trm_model.embed_input(question_tokens)
-                (y, z), y_hat = trm_model(x, y, z)
+            (_, _), y_hat = trm_model(x, y, z)
 
             loss = loss_fn(y_hat.reshape(-1, 10), answer_tokens.reshape(-1))
             val_loss += loss.item()

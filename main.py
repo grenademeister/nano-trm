@@ -100,7 +100,7 @@ class TRM(nn.Module):
         for _ in range(self.n):  # latent reasoning
             combined_context = torch.cat([x, y], dim=1)
             z = self.net(query=z, context=combined_context)
-        y = self.net(query=y, context=z)  # answer refinement
+        y = self.net2(query=y, context=z)  # answer refinement
         return y, z
 
     def forward(self, x, y, z):
@@ -113,12 +113,12 @@ class TRM(nn.Module):
 
 def main():
     parser = argparse.ArgumentParser(description="d")
-    parser.add_argument('--ds',action='store_true',help='whether use deep supervision')
+    parser.add_argument('--ds',action='store_true',help='whether to use deep supervision')
     parser.add_argument('--att',type=str,default='self_att',help='self_att or mlp ( for sudoku)')
     parser.add_argument('--ema',action='store_true',help='using ema')
     args = parser.parse_args()
     embed_dim = 512
-    batch_size = 8
+    batch_size = 2
     max_supervision_steps = 16  # N_sup from the paper
     max_val_batches = 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

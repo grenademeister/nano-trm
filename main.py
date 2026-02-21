@@ -100,7 +100,7 @@ class TRM(nn.Module):
         for _ in range(self.n):  # latent reasoning
             combined_context = torch.cat([x, y], dim=1)
             z = self.net(query=z, context=combined_context)
-        y = self.net2(query=y, context=z)  # answer refinement
+        y = self.net(query=y, context=z)  # answer refinement
         return y, z
 
     def forward(self, x, y, z):

@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from datasets import load_dataset, Features, Value
 from torch.utils.data import DataLoader
+import argparse
+
 
 features = Features(
     {
@@ -34,11 +36,27 @@ def encode_row(row):
     return values
 
 
+def print_model_parameter_count(model: nn.Module) -> None:
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+
+
 class TinyNetworkBlock(nn.Module):
-    def __init__(self, embed_dim=512, num_heads=8):
+    def __init__(self, embed_dim=512, num_heads=8,att='self_att'):
         super().__init__()
         self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        if(att == 'self_att'):
+            self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        elif(att == 'mlp'):
+            self.attn =nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim),
+        )
+        else:
+            raise ValueError(f"arg parse att should be att or mlp , not {att}")
         self.norm2 = nn.LayerNorm(embed_dim)
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
@@ -56,9 +74,9 @@ class TinyNetworkBlock(nn.Module):
 
 
 class TRM(nn.Module):
-    def __init__(self, embed_dim=512, n_reasoning_steps=6, n_recursion_steps=3):
+    def __init__(self, embed_dim=512, n_reasoning_steps=6, n_recursion_steps=3,att='self_att'):
         super().__init__()
-        self.net = TinyNetworkBlock(embed_dim)
+        self.net = TinyNetworkBlock(embed_dim,att=att)
         self.n = n_reasoning_steps
         self.T = n_recursion_steps
         self.token_embedding = nn.Embedding(10, embed_dim)
@@ -88,6 +106,11 @@ class TRM(nn.Module):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="d")
+    parser.add_argument('--ds',action='store_true',help='whether use deep supervision')
+    parser.add_argument('--att',type=str,default='self_att',help='self_att or mlp ( for sudoku)')
+    parser.add_argument('--ema',action='store_true',help='using ema')
+    args = parser.parse_args()
     embed_dim = 512
     batch_size = 16
     max_supervision_steps = 16  # N_sup from the paper
@@ -95,7 +118,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    trm_model = TRM(embed_dim, n_reasoning_steps=6).to(device)
+    trm_model = TRM(embed_dim, n_reasoning_steps=6,att = args.att).to(device)
+    print_model_parameter_count(trm_model)
     trm_model.train()
     optimizer = torch.optim.Adam(trm_model.parameters(), lr=1e-4)
     loss_fn = nn.CrossEntropyLoss()
@@ -132,9 +156,12 @@ def main():
         for _ in range(max_supervision_steps):
             optimizer.zero_grad(set_to_none=True)
             x = trm_model.embed_input(question_tokens)
-            y = x.clone()
-            z = x.clone()
-            (_, _), y_hat = trm_model(x, y, z)
+            if(args.ds and (_!=0)):
+                (y,z),y_hat = trm_model(x,y,z)
+            else:
+                y = x.clone()
+                z = x.clone()
+            (a, b), y_hat = trm_model(x, y, z)
             loss = loss_fn(y_hat.reshape(-1, 10), answer_tokens.reshape(-1))
             loss.backward()
             optimizer.step()
